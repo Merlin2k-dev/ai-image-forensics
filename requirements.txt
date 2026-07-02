@@ -1,0 +1,8 @@
+# Pinned: the model bundle is a joblib pickle, keep scikit-learn at this version.
+numpy==2.5.0
+scipy==1.18.0
+scikit-learn==1.9.0
+joblib==1.5.3
+pillow==12.2.0
+pandas==3.0.3
+pytest==9.1.1
