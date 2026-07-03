@@ -76,3 +76,4 @@ result = Predictor().predict("image.jpg")
     models/                   frozen model bundle + spectral templates
     tests/                    unit tests
     experiments/              feature families tried and rejected, with reasons
+    research/                 dated experiment log and pre-registrations
