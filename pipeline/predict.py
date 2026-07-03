@@ -7,7 +7,7 @@ panels for one image. Pipeline per upload:
   -> center 512 crop (plus 4 corner crops when short side >= 1024, median of 5)
   -> JPEG q75 4:2:0 re-encode (training substrate) -> 27 features
   -> channel scores -> right-tail p-value against a pooled real-photo reference
-  -> banded verdict (AI / inconclusive / real) with thresholds stored in the bundle
+  -> banded verdict (AI / leaning AI / inconclusive / real); thresholds from the bundle's real-photo null
   -> provenance metadata reported as a separate panel, never mixed into the score
 
 Score strength is reported as a real-photo percentile rather than a probability;
@@ -136,7 +136,9 @@ class Predictor:
         s = zmed["v2"]
         null = b["real_null_scores"]
         real_pctile = float(np.searchsorted(null, s) / len(null) * 100.0)
+        t_mid = float(np.quantile(null, 0.80))
         verdict = ("LIKELY AI-GENERATED" if s >= b["t_hi"]
+                   else "LEANING AI-GENERATED" if s >= t_mid
                    else "LIKELY REAL" if s <= b["t_lo"] else "INCONCLUSIVE")
         panels = []
         for k, z in zmed.items():
@@ -146,11 +148,14 @@ class Predictor:
                            "explanation": expl})
         return {
             "verdict": verdict,
+            "input_size": f"{W}x{H}",
             "score_z": round(s, 3),
             "real_percentile": round(real_pctile, 1),
             "strength_text": (f"Pixel statistics are more anomalous than {real_pctile:.0f}% of "
                               "real photos in the reference corpora."),
-            "bands": {"real_at_or_below": round(b["t_lo"], 3), "ai_at_or_above": round(b["t_hi"], 3)},
+            "bands": {"real_at_or_below": round(b["t_lo"], 3),
+                      "leaning_at_or_above": round(t_mid, 3),
+                      "ai_at_or_above": round(b["t_hi"], 3)},
             "n_crops": len(crops), "panels": panels, "provenance": prov,
             "limitations": (
                 "Trained on specific generator families; strongest on FLUX/Stable-Diffusion-lineage "
