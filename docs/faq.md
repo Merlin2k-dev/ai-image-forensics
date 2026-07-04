@@ -7,6 +7,13 @@ from a camera or from an AI image generator. It answers with one of three
 verdicts: likely AI-generated, likely real, or inconclusive. It also shows you
 the evidence behind the verdict, panel by panel, in plain English.
 
+## What happens to images that get uploaded?
+
+Nothing stays on the server. An uploaded image is measured in memory and discarded as
+soon as the verdict is computed. It is never written to disk, never logged and never
+used for anything else. Anyone who prefers not to send an image anywhere can run the
+pipeline locally from this repository, in which case nothing leaves their machine.
+
 ## Why does it sometimes say "inconclusive"?
 
 Because sometimes the honest answer is "I can't tell", and I would rather say
