@@ -1,4 +1,4 @@
-# How the detector works (plain-English)
+# How the detector works
 
 Imagine an art expert checking whether a painting is a forgery.
 
