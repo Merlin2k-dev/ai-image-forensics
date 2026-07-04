@@ -31,6 +31,7 @@ from pipeline.features.sensor_absence import extract_sensor_features
 from pipeline.features.vae_decoder import extract_vae_features
 from pipeline.preprocess import JPEG_QUALITY, JPEG_SUBSAMPLING
 from pipeline.provenance import analyze as provenance_analyze
+from pipeline.watermark import analyze as watermark_analyze
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 DEFAULT_BUNDLE = ROOT / "models/detector_bundle.joblib"
@@ -128,6 +129,7 @@ class Predictor:
                     "detail": f"Image is {W}x{H}; the forensic model needs at least 512px on the "
                               "short side and never upscales (upscaling would destroy the pixel "
                               "statistics it measures). Provenance panel is still valid."}
+        wm = watermark_analyze(arr)
         crops = self._crops(arr, self.multicrop)
         per_crop = [self._channel_scores(self._feats(c)) for c in crops]
         zmed = {k: float(np.median([self._z(k, pc[k]) for pc in per_crop]))
@@ -140,6 +142,13 @@ class Predictor:
         verdict = ("LIKELY AI-GENERATED" if s >= b["t_hi"]
                    else "LEANING AI-GENERATED" if s >= t_mid
                    else "LIKELY REAL" if s <= b["t_lo"] else "INCONCLUSIVE")
+        basis = "pixel statistics"
+        if wm["found"]:
+            # a generator's visible stamp at its documented position is decisive,
+            # independently of the pixel score; thresholds are calibrated so that
+            # no clean corner in the reference corpora ever fires
+            verdict = "LIKELY AI-GENERATED"
+            basis = "visible watermark: " + wm["found"][0]["mark"]
         panels = []
         for k, z in zmed.items():
             title, expl = CHANNEL_EXPLAIN[k]
@@ -148,6 +157,8 @@ class Predictor:
                            "explanation": expl})
         return {
             "verdict": verdict,
+            "verdict_basis": basis,
+            "watermark": wm,
             "input_size": f"{W}x{H}",
             "score_z": round(s, 3),
             "real_percentile": round(real_pctile, 1),
