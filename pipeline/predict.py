@@ -22,20 +22,19 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import joblib
 import numpy as np
 from PIL import Image
-from scipy import ndimage
 from scipy.stats import norm
 
 from pipeline.features.inversion_residual import extract_inversion_features
 from pipeline.features.self_consistency import extract_selfconsistency_features
 from pipeline.features.sensor_absence import extract_sensor_features
 from pipeline.features.vae_decoder import extract_vae_features
+from pipeline.ingest import IngestError, load_rgb
 from pipeline.preprocess import JPEG_QUALITY, JPEG_SUBSAMPLING
 from pipeline.provenance import analyze as provenance_analyze
 from pipeline.watermark import analyze as watermark_analyze
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 DEFAULT_BUNDLE = ROOT / "models/detector_bundle.joblib"
-TEMPLATES = ROOT / "models/spectral_templates.npz"
 MULTICROP_MIN_SIDE = 1024  # multi-crop helps at >=1024, hurts below (overlapping crops)
 
 CHANNEL_EXPLAIN = {
@@ -45,11 +44,6 @@ CHANNEL_EXPLAIN = {
     "env": ("Distance from the real-photo envelope",
             "Measures how far the image's statistics sit from the envelope of genuine camera photos; "
             "frontier generators can be flagged for being unnaturally smooth/consistent."),
-    "sid": ("Google-family spectral signature",
-            "Looks for a frequency-domain spectral pattern consistent with Google's image "
-            "generators (Gemini/Imagen family, plausibly their SynthID watermarking). Scoped: "
-            "fires only on that family; strength varies by source (measured 0.55-0.70 AUC "
-            "across surfaces); removable by heavy re-processing."),
 }
 
 
@@ -61,8 +55,6 @@ def _strength(z):
 class Predictor:
     def __init__(self, bundle_path=DEFAULT_BUNDLE, multicrop=True):
         self.b = joblib.load(bundle_path)
-        z = np.load(TEMPLATES)
-        self.tpl = {"T": z["Tn_offgrid"], "mask": z["mask_offgrid"]}
         self.multicrop = multicrop
 
     @staticmethod
@@ -88,22 +80,28 @@ class Predictor:
         d.update(extract_sensor_features(a))
         d.update(extract_inversion_features(a))
         d.update(extract_selfconsistency_features(a))
-        Y = a.astype(float) @ [0.299, 0.587, 0.114]
-        F = np.fft.fftshift(np.fft.fft2(Y - ndimage.gaussian_filter(Y, 1.5)))
-        d["sid_nano_proj"] = float(np.real(np.vdot(self.tpl["T"], F)))
-        d["sid_nano_peake"] = float((np.abs(F)[self.tpl["mask"]] ** 2).sum())
         return d
 
     def _channel_scores(self, d):
+        """Per-crop channel scores from the 27 features.
+
+        A flat or near-uniform crop makes some features non-finite. The frozen
+        bundle has no imputation for them, so the standardized vector is imputed to
+        0 (the training mean, since StandardScaler centers on it). This keeps a
+        degenerate crop from crashing the model or sorting NaN into the anomalous
+        tail; it scores as neutral and the caller is told imputation fired.
+        """
         b = self.b
         v2 = np.array([[d[k] for k in b["V2F"]]], float)
-        sid = np.array([[d.get(k, np.nan) for k in b["SIDN"]]], float)
-        med = b["impute_medians"]
-        sid = np.where(np.isnan(sid), med[b["SIDN"]].to_numpy(float), sid)
+        imputed = not np.isfinite(v2).all()
+
+        def _clean(x):
+            return np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+
         return {
-            "v2": float(b["clfV"].decision_function(b["scV"].transform(v2))[0]),
-            "env": float(b["lw"].mahalanobis(b["scE"].transform(v2))[0]),
-            "sid": float(b["clfS"].decision_function(b["scS"].transform(sid))[0]),
+            "v2": float(b["clfV"].decision_function(_clean(b["scV"].transform(v2)))[0]),
+            "env": float(b["lw"].mahalanobis(_clean(b["scE"].transform(v2)))[0]),
+            "_imputed": imputed,
         }
 
     def _z(self, channel, score):
@@ -119,21 +117,38 @@ class Predictor:
                                         "checked": [], "evidence": []}
         else:
             try:
-                arr = np.asarray(Image.open(path_or_array).convert("RGB"), np.uint8)
-            except OSError as e:
-                return {"verdict": "ERROR", "detail": f"Could not read image: {e}", "provenance": None}
+                arr = load_rgb(path_or_array)
+            except IngestError as e:
+                return {"verdict": "ERROR", "detail": str(e), "provenance": None}
             prov = provenance_analyze(str(path_or_array))
         H, W = arr.shape[:2]
-        if min(H, W) < 512:
-            return {"verdict": "UNSUPPORTED", "provenance": prov,
-                    "detail": f"Image is {W}x{H}; the forensic model needs at least 512px on the "
-                              "short side and never upscales (upscaling would destroy the pixel "
-                              "statistics it measures). Provenance panel is still valid."}
+        # The visible-watermark panel works at full resolution and its own scale
+        # envelope reaches below 512px on the short side (e.g. a 16:9 stamped frame),
+        # so it runs BEFORE the pixel model's size gate; only the pixel score is gated.
         wm = watermark_analyze(arr)
+        if min(H, W) < 512:
+            out = {"verdict": "UNSUPPORTED", "provenance": prov, "watermark": wm,
+                   "verdict_basis": "pixel statistics",
+                   "detail": f"Image is {W}x{H}; the forensic model needs at least 512px on the "
+                             "short side and never upscales (upscaling would destroy the pixel "
+                             "statistics it measures). Provenance panel is still valid."}
+            if wm["found"]:
+                out["verdict"] = "LIKELY AI-GENERATED"
+                out["verdict_basis"] = "visible watermark: " + wm["found"][0]["mark"]
+            return out
         crops = self._crops(arr, self.multicrop)
         per_crop = [self._channel_scores(self._feats(c)) for c in crops]
+        imputed = any(pc["_imputed"] for pc in per_crop)
+        # The median over crops already absorbs a minority of degenerate crops (say a
+        # landscape with one plain-sky corner), so those need no special handling. But
+        # when the majority of crops are degenerate the median is unreliable: a flat
+        # image's real features (no sensor noise, very smooth) look anomalous versus a
+        # real photo, i.e. AI-like, for reasons that are not generation. In that case
+        # the pixel verdict is capped to INCONCLUSIVE. A watermark or provenance hit can
+        # still escalate it below.
+        degenerate = sum(pc["_imputed"] for pc in per_crop) * 2 > len(per_crop)
         zmed = {k: float(np.median([self._z(k, pc[k]) for pc in per_crop]))
-                for k in ("v2", "env", "sid")}
+                for k in ("v2", "env")}
         b = self.b
         s = zmed["v2"]
         null = b["real_null_scores"]
@@ -143,6 +158,9 @@ class Predictor:
                    else "LEANING AI-GENERATED" if s >= t_mid
                    else "LIKELY REAL" if s <= b["t_lo"] else "INCONCLUSIVE")
         basis = "pixel statistics"
+        if degenerate:
+            # pixel measurement unreliable in both directions -> make no pixel claim
+            verdict, basis = "INCONCLUSIVE", "degenerate input (pixel model abstained)"
         if wm["found"]:
             # a generator's visible stamp at its documented position is decisive,
             # independently of the pixel score; thresholds are calibrated so that
@@ -168,6 +186,12 @@ class Predictor:
                       "leaning_at_or_above": round(t_mid, 3),
                       "ai_at_or_above": round(b["t_hi"], 3)},
             "n_crops": len(crops), "panels": panels, "provenance": prov,
+            "degenerate_input": imputed,
+            "degenerate_note": (
+                "Part of this image is flat/near-uniform (e.g. a plain background, sky, "
+                "or solid fill), so some pixel-statistic features were undefined and "
+                "imputed to their neutral value. The pixel verdict is correspondingly "
+                "less certain." if imputed else None),
             "limitations": (
                 "Trained on specific generator families; strongest on FLUX/Stable-Diffusion-lineage "
                 "images, weaker on the newest closed-lab generators (GPT-Image, Midjourney, Qwen, "

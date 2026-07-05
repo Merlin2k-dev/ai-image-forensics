@@ -6,19 +6,31 @@ full-resolution array before cropping. Display-only evidence, same class as the
 provenance panel: a match is strong (the stamp sits at a deterministic, documented
 offset), absence means nothing (paid tiers, APIs and any crop remove it).
 
+Delivered images are routinely uniform downscales of the canonical rendition (mobile
+save paths, share sheets, preview saves), which shrink the stamp and its offset
+together. The matcher therefore works at the scale IMPLIED BY THE IMAGE DIMENSIONS:
+per mark, scale f = min(1, long_side / canonical_long_side) (Gemini's canonical size
+depends on aspect class); the template and its documented margins are scaled by f and
+matched at delivered resolution. Nothing is searched over scale (f is deterministic),
+and f = 1 reproduces the original native-size matching exactly. Below a 24px template
+the mark is skipped (not checked): reliable matching has a floor.
+
 Per mark: dual-channel ZNCC (luma + 3x3 Laplacian residual) of a genuine stamp
 capture against a small search box around the documented offset only -- no free
 corner scan; real corners contain enough sparkle-like blobs that an unconstrained
 scan needs thresholds too high to catch low-alpha stamps. A mark is reported only
-when min(luma, residual) clears its threshold, calibrated so that no corner window
-in the clean reference corpora fires (max negative * 1.15, floor 0.10).
+when min(luma, residual) clears its threshold. Thresholds are per template scale,
+calibrated so that no corner window in the clean reference corpora fires
+(max negative * 1.15, floor 0.10) at that scale; the validated native-size
+thresholds are kept as floors.
 
-Bank: models/watermark_bank.npz (templates, position rules, thresholds).
+Bank: models/watermark_bank.npz (master templates, geometry, per-scale thresholds).
 """
 import json
 import pathlib
 
 import numpy as np
+from PIL import Image
 from scipy.signal import fftconvolve
 
 BANK = pathlib.Path(__file__).resolve().parents[1] / "models/watermark_bank.npz"
@@ -75,42 +87,68 @@ def prior_score(luma, tpl, margin_right, margin_bottom, tol=TOL):
     return float(box.max()) if box.size else None
 
 
-def _gemini_small_margin(H, W):
-    """V2 small profile: margin inherits the downscale from the canonical
-    large source; short-side thresholds bisect the observed canonical heights
-    (geometry recovered from allenk/GeminiWatermarkTool)."""
-    canon = 2752 if min(H, W) >= 566 else (2816 if min(H, W) >= 550 else 2848)
-    return int(round(192.0 * max(H, W) / canon))
+def _implied_scale(m, H, W):
+    """Scale of this delivery relative to the mark's canonical rendition.
+
+    Gemini's canonical long side depends on the aspect class (short-side ratios
+    bisect the observed canonical heights; geometry recovered from
+    allenk/GeminiWatermarkTool). Uniform downscales preserve the ratio, so the
+    same rule covers every delivered size. Oversize images clamp to 1.
+    """
+    if m["kind"] == "gemini":
+        r = min(H, W) / max(H, W)
+        canon = 2752 if r >= 566 / 1024 else (2816 if r >= 550 / 1024 else 2848)
+    else:
+        canon = m["canon"]
+    return min(1.0, max(H, W) / canon)
+
+
+def _resize_template(tpl, f):
+    if abs(f - 1.0) < 1e-9:
+        return tpl
+    h, w = tpl.shape
+    im = Image.fromarray(tpl.astype(np.float32), "F")
+    return np.asarray(im.resize((max(1, round(w * f)), max(1, round(h * f))),
+                                Image.LANCZOS), np.float32)
+
+
+def _threshold(m, size):
+    """Threshold for this template size: an exact rung hit uses its own calibrated
+    threshold (the native size lands here); between rungs, the max of the two
+    nearest brackets (conservative)."""
+    exact = [t for s, t in m["rungs"] if s == size]
+    if exact:
+        return exact[0]
+    rungs = sorted(m["rungs"], key=lambda rt: abs(rt[0] - size))[:2]
+    return max(t for _, t in rungs)
 
 
 def analyze(arr) -> dict:
     """Check one full-resolution RGB uint8 array against the stamp bank.
 
     Returns {"checked": [names], "found": [{generator, mark, score, threshold,
-    corner}]}. Marks whose position prior does not fit the image are skipped,
-    never guessed.
+    corner, scale}]}. Marks whose scaled template would fall below the matching
+    floor, or whose position prior does not fit the image, are skipped, never
+    guessed.
     """
     luma = (arr.astype(np.float32) @ np.array([0.299, 0.587, 0.114], np.float32)
             if arr.ndim == 3 else arr.astype(np.float32))
     H, W = luma.shape
     checked, found = [], []
-    for m, tpl in _load():
-        if m["gate"] == "both_gt_1024":
-            if not (H > 1024 and W > 1024):
-                continue
-            mr = mb = m["margin"]
-        elif m["gate"] == "both_le_1024":
-            if H > 1024 and W > 1024:
-                continue
-            mr = mb = _gemini_small_margin(H, W)
-        else:
-            mr, mb = m["margin_right"], m["margin_bottom"]
-        s = prior_score(luma, tpl, mr, mb)
+    for m, master in _load():
+        f = _implied_scale(m, H, W)
+        size = round(m["base"] * f)
+        if size < m["min_tpl"]:
+            continue
+        tpl = _resize_template(master, f)
+        s = prior_score(luma, tpl, round(m["margin_right"] * f),
+                        round(m["margin_bottom"] * f))
         if s is None:
             continue
         checked.append(m["name"])
-        if s > m["threshold"]:
+        thr = _threshold(m, size)
+        if s > thr:
             found.append({"generator": m["generator"], "mark": m["mark"],
-                          "score": round(s, 3), "threshold": m["threshold"],
-                          "corner": "bottom-right"})
+                          "score": round(s, 3), "threshold": thr,
+                          "corner": "bottom-right", "scale": round(f, 3)})
     return {"checked": checked, "found": found}
