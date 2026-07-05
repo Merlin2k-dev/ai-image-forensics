@@ -8,6 +8,5 @@ pandas==3.0.3
 pyarrow==24.0.0
 pytest==9.1.1
 # Provenance channel: reads C2PA Content Credentials manifests. Without this the
-# c2pa import in pipeline/provenance.py silently no-ops (the scoring service ran
-# without it and never checked C2PA). Ships cp312 manylinux wheels.
-c2pa==0.36.0
+# c2pa import in pipeline/provenance.py silently no-ops.
+c2pa==1.4.1
